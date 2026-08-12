@@ -1,0 +1,10 @@
+streamlit
+pandas
+numpy
+matplotlib
+plotly
+reportlab
+openpyxl
+pyarrow
+pyreadstat
+google-genai
