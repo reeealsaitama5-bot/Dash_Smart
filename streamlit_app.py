@@ -43,17 +43,27 @@ GRID = "#DCE3EC"
 BG_CARD = "#FFFFFF"
 BG_PAGE = "#FFFFFF"
 ID_NAME_PATTERN = re.compile(
-    r"(^id$|_id$|^id_|code|identifiant|uuid|guid|^ref$|_ref$|^n[uo]m[ée]ro)",
+    r"(^id$|_id$|^id_|code|identifiant|identifier|uuid|guid|^ref$|_ref$|^key$|_key$|^n[uo]m[ée]ro|^number$)",
     re.IGNORECASE,
 )
+# Bilingue français/anglais : la détection de hiérarchie géographique ne doit pas
+# dépendre de la langue des noms de colonnes.
 GEO_HIERARCHY_PATTERN = re.compile(
-    r"(r[ée]gion|d[ée]partement|arrondissement|commune|com_arrt|ville|quartier|village|hameau|province|district|zone|localit[ée])",
+    r"(r[ée]gion|region|d[ée]partement|department|arrondissement|commune|com_arrt|"
+    r"\bville\b|\bcity\b|\btown(?:ship)?\b|quartier|neighbou?rhood|village|hameau|hamlet|"
+    r"province|district|\bzone\b|localit[ée]|\blocality\b|borough|municipalit[éy]|\bward\b|"
+    r"\bcounty\b|\bstate\b|\bcountry\b|\bpays\b|suburb|parish|\bzip\b|postal[_ ]?code|\bcp\b)",
     re.IGNORECASE,
 )
 DEMO_COUNT_PATTERN = re.compile(
-    r"(^population$|^pop$|hommes?$|femmes?$|m[ée]nages?$|concessions?$|habitants?$|effectif)",
+    r"(^population$|^pop$|hommes?$|femmes?$|m[ée]nages?$|concessions?$|habitants?$|effectif|"
+    r"\bmales?$|\bfemales?$|\bmen$|\bwomen$|households?$|families?$|inhabitants?$|residents?$)",
     re.IGNORECASE,
 )
+# Colonnes de coordonnées géographiques (latitude/longitude), très fréquentes dans les
+# données de mobilité, géolocalisation, capteurs, etc. — indépendant de la langue.
+LAT_PATTERN = re.compile(r"^(?P<prefix>.*?)[_\s]*lat(?:itude)?$", re.IGNORECASE)
+LON_PATTERN = re.compile(r"^(?P<prefix>.*?)[_\s]*(?:lon(?:gitude)?|lng)$", re.IGNORECASE)
 MAX_ROWS_COMFORTABLE = 300_000
 MAX_PREVIEW_ROWS = 200
 SUPPORTED_EXTENSIONS = [
@@ -218,10 +228,10 @@ def detect_geo_demo(df: pd.DataFrame, types: dict) -> dict:
     # Ordonne du plus large au plus fin selon le nombre de modalités distinctes.
     geo_cols = sorted(set(geo_cols), key=lambda c: df[c].nunique(dropna=True))
     demo_cols = [c for c in types["numeric"] if DEMO_COUNT_PATTERN.search(str(c))]
-    male_col = next((c for c in demo_cols if re.search(r"hommes?$", str(c), re.IGNORECASE)), None)
-    female_col = next((c for c in demo_cols if re.search(r"femmes?$", str(c), re.IGNORECASE)), None)
-    pop_col = next((c for c in demo_cols if re.search(r"^population$|^pop$|habitants?$", str(c), re.IGNORECASE)), None)
-    household_col = next((c for c in demo_cols if re.search(r"m[ée]nages?$", str(c), re.IGNORECASE)), None)
+    male_col = next((c for c in demo_cols if re.search(r"hommes?$|\bmales?$|\bmen$", str(c), re.IGNORECASE)), None)
+    female_col = next((c for c in demo_cols if re.search(r"femmes?$|\bfemales?$|\bwomen$", str(c), re.IGNORECASE)), None)
+    pop_col = next((c for c in demo_cols if re.search(r"^population$|^pop$|habitants?$|inhabitants?$|residents?$", str(c), re.IGNORECASE)), None)
+    household_col = next((c for c in demo_cols if re.search(r"m[ée]nages?$|households?$|families?$", str(c), re.IGNORECASE)), None)
     return {
         "is_census_like": len(geo_cols) >= 1 and len(demo_cols) >= 1,
         "geo_cols": geo_cols,
@@ -231,6 +241,32 @@ def detect_geo_demo(df: pd.DataFrame, types: dict) -> dict:
         "pop_col": pop_col,
         "household_col": household_col,
     }
+
+
+def detect_coordinates(df: pd.DataFrame, numeric_cols: list[str]) -> list[dict]:
+    """Repère les paires latitude/longitude (ex : pickup_latitude / pickup_longitude),
+    fréquentes dans les données de mobilité, livraison, capteurs, etc. Ne dépend pas de
+    noms de colonnes en français : reconnaît lat/latitude/lon/longitude/lng dans n'importe
+    quelle langue, avec ou sans préfixe (pickup_, dropoff_, store_…)."""
+    lats, lons = {}, {}
+    for c in numeric_cols:
+        valid = pd.to_numeric(df[c], errors="coerce").dropna()
+        if valid.empty:
+            continue
+        m = LAT_PATTERN.match(str(c).strip())
+        if m and valid.between(-90, 90).mean() > .98:
+            lats[m.group("prefix").strip("_ ").lower()] = c
+            continue
+        m = LON_PATTERN.match(str(c).strip())
+        if m and valid.between(-180, 180).mean() > .98:
+            lons[m.group("prefix").strip("_ ").lower()] = c
+    pairs = []
+    for prefix, lat_col in lats.items():
+        lon_col = lons.get(prefix)
+        if lon_col:
+            label = prefix.replace("_", " ").strip().title() or "Position"
+            pairs.append({"label": label, "lat": lat_col, "lon": lon_col})
+    return pairs
 
 
 def column_stats_rows(df: pd.DataFrame, types: dict) -> list[dict]:
@@ -421,8 +457,9 @@ def plotly_corr(df: pd.DataFrame, numeric_cols: list[str], method: str = "pearso
     return style_plotly(fig, f"Corrélations — {method.title()}", "", "", height=max(380, 55 * len(numeric_cols)))
 
 
-def plotly_timeseries(df: pd.DataFrame, date_col: str, value_col: str, freq: str) -> go.Figure | None:
-    valid = df[[date_col, value_col]].dropna(subset=[date_col]).copy()
+def plotly_timeseries(df: pd.DataFrame, date_col: str, value_col: str | None, freq: str) -> go.Figure | None:
+    cols = [date_col] if value_col is None else [date_col, value_col]
+    valid = df[cols].dropna(subset=[date_col]).copy()
     if valid.empty:
         return None
     valid[date_col] = pd.to_datetime(valid[date_col], errors="coerce")
@@ -466,6 +503,28 @@ def plotly_geo_treemap(df: pd.DataFrame, hierarchy_cols: list[str], value_col: s
                       color_discrete_sequence=[ACCENT_LIGHT, ACCENT, ACCENT_DARK, NAVY])
     fig.update_traces(marker=dict(line=dict(color="white", width=1)), textfont=dict(color=INK))
     return style_plotly(fig, f"Répartition de {value_col} — {' → '.join(hierarchy_cols)}", "", "", height=520)
+
+
+def plotly_points_map(df: pd.DataFrame, lat_col: str, lon_col: str, color_col: str | None,
+                       label: str, max_points: int = 8000) -> go.Figure:
+    """Carte de points pour des coordonnées lat/lon (mobilité, géolocalisation, capteurs…),
+    utilisable même sans aucune colonne géographique nommée (région, ville…)."""
+    valid = df[[lat_col, lon_col] + ([color_col] if color_col else [])].copy()
+    valid[lat_col] = pd.to_numeric(valid[lat_col], errors="coerce")
+    valid[lon_col] = pd.to_numeric(valid[lon_col], errors="coerce")
+    valid = valid.dropna(subset=[lat_col, lon_col])
+    valid = valid[valid[lat_col].between(-90, 90) & valid[lon_col].between(-180, 180)]
+    if len(valid) > max_points:
+        valid = valid.sample(max_points, random_state=0)
+    fig = px.scatter_map(
+        valid, lat=lat_col, lon=lon_col, color=color_col,
+        color_continuous_scale=PLOTLY_CORR_SCALE if color_col and pd.api.types.is_numeric_dtype(valid[color_col]) else None,
+        opacity=.65, zoom=9, height=520, map_style="open-street-map",
+    )
+    fig.update_traces(marker=dict(size=6) if not color_col else {})
+    fig.update_layout(margin=dict(l=0, r=0, t=42, b=0),
+                       title=dict(text=f"Carte des points — {label}", x=0, xanchor="left", font=dict(size=13, color=NAVY)))
+    return fig
 
 
 def style_plotly(fig: go.Figure, title: str, x_title: str = "", y_title: str = "", height: int = 340) -> go.Figure:
@@ -535,9 +594,15 @@ def make_matplotlib_corr(df: pd.DataFrame, cols: list[str], method: str) -> plt.
 # Insights et IA
 # -----------------------------------------------------------------------------
 
-def generate_insights(df: pd.DataFrame, types: dict, outlier_rows: int = 0, geo: dict | None = None) -> list[str]:
+def generate_insights(df: pd.DataFrame, types: dict, outlier_rows: int = 0, geo: dict | None = None,
+                       coord_pairs: list[dict] | None = None) -> list[str]:
     out = []
     q = quality_report(df)
+    if coord_pairs:
+        p = coord_pairs[0]
+        lat_valid = pd.to_numeric(df[p["lat"]], errors="coerce").dropna()
+        if len(lat_valid):
+            out.append(f"**Géolocalisation —** {len(coord_pairs)} jeu(x) de coordonnées détecté(s) ({', '.join(c['label'] for c in coord_pairs)}), consultez l'onglet Carte.")
     if geo and geo["is_census_like"]:
         finest = geo["geo_cols"][-1] if geo["geo_cols"] else None
         broadest = geo["geo_cols"][0] if geo["geo_cols"] else None
@@ -614,16 +679,25 @@ def safe_filename(text: str) -> str:
     return "_".join(keep.split()).lower()[:80] or "dashboard"
 
 
+def _strip_tz(df: pd.DataFrame) -> pd.DataFrame:
+    """Excel (openpyxl) ne supporte pas les datetimes avec fuseau horaire : on les rend naïfs."""
+    out = df.copy()
+    for col in out.columns:
+        if pd.api.types.is_datetime64_any_dtype(out[col]) and getattr(out[col].dt, "tz", None) is not None:
+            out[col] = out[col].dt.tz_localize(None)
+    return out
+
+
 def to_excel_bytes(df: pd.DataFrame, stats: pd.DataFrame | None = None, outliers: pd.DataFrame | None = None, cleaned: pd.DataFrame | None = None) -> bytes:
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Données")
+        _strip_tz(df).to_excel(writer, index=False, sheet_name="Données")
         if cleaned is not None:
-            cleaned.to_excel(writer, index=False, sheet_name="Nettoyées")
+            _strip_tz(cleaned).to_excel(writer, index=False, sheet_name="Nettoyées")
         if stats is not None and not stats.empty:
             stats.to_excel(writer, index=False, sheet_name="Statistiques")
         if outliers is not None and not outliers.empty:
-            outliers.to_excel(writer, index=False, sheet_name="Anomalies")
+            _strip_tz(outliers).to_excel(writer, index=False, sheet_name="Anomalies")
     buf.seek(0)
     return buf.getvalue()
 
@@ -732,6 +806,7 @@ if len(df) > MAX_ROWS_COMFORTABLE:
 
 types = detect_column_types(df, max_categorical)
 geo = detect_geo_demo(df, types)
+coord_pairs = detect_coordinates(df, types["numeric"])
 q = quality_report(df)
 stats_rows = column_stats_rows(df, types)
 stats_num = numeric_profile(df, types["numeric"])
@@ -756,7 +831,7 @@ st.progress(quality_score / 100, text=f"Score indicatif de qualité : {quality_s
 # Observations
 # -----------------------------------------------------------------------------
 outlier_summary, outlier_mask, outlier_bounds = detect_outliers(df, types["numeric"], outlier_method, threshold)
-insights = generate_insights(df, types, int(outlier_mask.sum()), geo)
+insights = generate_insights(df, types, int(outlier_mask.sum()), geo, coord_pairs)
 st.markdown('<div class="section-title">Observations automatiques</div>', unsafe_allow_html=True)
 for line in insights:
     line_html = re.sub(r"\*\*(.*?)\*\*", r"<b>\1</b>", line)
@@ -768,6 +843,8 @@ for line in insights:
 tab_labels = ["Vue d’ensemble", "Données", "Nettoyage", "Visualisations"]
 if geo["is_census_like"]:
     tab_labels.append("Géo / Démo")
+if coord_pairs:
+    tab_labels.append("Carte")
 tab_labels += ["Statistiques", "Anomalies", "IA", "Exports"]
 tabs = st.tabs(tab_labels)
 tab_overview, tab_data, tab_clean, tab_viz = tabs[0], tabs[1], tabs[2], tabs[3]
@@ -776,6 +853,10 @@ if geo["is_census_like"]:
     tab_geo = tabs[next_idx]; next_idx += 1
 else:
     tab_geo = None
+if coord_pairs:
+    tab_map = tabs[next_idx]; next_idx += 1
+else:
+    tab_map = None
 tab_stats, tab_anom, tab_ai, tab_export = tabs[next_idx], tabs[next_idx+1], tabs[next_idx+2], tabs[next_idx+3]
 
 with tab_overview:
@@ -889,6 +970,30 @@ if tab_geo is not None:
         st.dataframe(agg_table, use_container_width=True, hide_index=True)
         st.download_button("Exporter l'agrégation", agg_table.to_csv(index=False).encode("utf-8-sig"),
                             f"agregation_{safe_filename(level)}.csv", "text/csv", key="geo_export")
+
+if tab_map is not None:
+    with tab_map:
+        st.subheader("Carte des points géolocalisés")
+        st.caption("Détecté automatiquement : colonnes de latitude/longitude (mobilité, livraison, capteurs…), sans besoin de colonnes région/ville nommées.")
+        pair_labels = [p["label"] for p in coord_pairs]
+        pair_choice = st.selectbox("Jeu de coordonnées", pair_labels, key="map_pair") if len(pair_labels) > 1 else pair_labels[0]
+        pair = next(p for p in coord_pairs if p["label"] == pair_choice)
+
+        color_options = ["Aucune"] + types["numeric"] + [c for c in types["categorical"] if df[c].nunique(dropna=True) <= 20]
+        color_choice = st.selectbox("Colorer par", color_options, key="map_color")
+        color_col = None if color_choice == "Aucune" else color_choice
+
+        lat_valid = pd.to_numeric(df[pair["lat"]], errors="coerce").dropna()
+        lon_valid = pd.to_numeric(df[pair["lon"]], errors="coerce").dropna()
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Points valides", f"{lat_valid.shape[0]:,}".replace(",", " "))
+        m2.metric("Étendue latitude", f"{lat_valid.min():.3f} → {lat_valid.max():.3f}")
+        m3.metric("Étendue longitude", f"{lon_valid.min():.3f} → {lon_valid.max():.3f}")
+
+        st.plotly_chart(plotly_points_map(df, pair["lat"], pair["lon"], color_col, pair["label"]), use_container_width=True, key="points_map")
+
+        if len(coord_pairs) >= 2:
+            st.caption(f"{len(coord_pairs)} jeux de coordonnées détectés : {', '.join(pair_labels)}. Change de sélection ci-dessus pour comparer (ex. prise en charge vs dépose).")
 
 with tab_stats:
     st.subheader("Statistiques descriptives")
